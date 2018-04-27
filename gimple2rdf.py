@@ -20,9 +20,11 @@ BLACKLIST = ["unsigned_equivalent", "signed_equivalent", "sizeof",
 
 # because using the blacklist we got a VERY big, verbose graph,
 # we now try it using a whitelist
-ALL = uuid.uuid4() # signs "export all properties"
-WHITELIST = {gcc.BasicBlock: ALL,
-             gcc.Edge: ALL,
+# for each type all properties to expand the graph traversal on are
+# listed. Those that should NOT be expressed in RDF (a minority) are
+# given in brackets.
+WHITELIST = {gcc.BasicBlock: ["gimple", "(succs)", "(preds)"],
+             gcc.Edge: ["src", "dest"],
              gcc.GimpleAssign: ["lhs", "loc", "rhs"],
              gcc.SsaName: ["def_stmt"],
              gcc.ArrayRef: ["array", "index", "location"],
@@ -39,8 +41,19 @@ WHITELIST = {gcc.BasicBlock: ALL,
              gcc.VarDecl: ["location", "name"],
              gcc.FunctionDecl: ["arguments", "function", "location", "name", "result"],
              gcc.Function: ["cfg", "decl", "end", "local_decls"],
-             gcc.Cfg: ALL
+             gcc.Cfg: ["basic_blocks", "entry", "exit"]
              }
+# we now analyse WHITELIST, find the cases where an RDF expression
+# shall be suppressed and create a separate dict for them as well as
+# overwriting WHITELIST with a bracket-less variant (to correctly match
+# the actual properties)
+def to_be_suppressed(w: str) -> bool:
+    return w[0] == '(' and w[-1] == ')'
+def filter_whitelist(wl):
+    return [w[1:-1] if to_be_suppressed(w) else w for w in wl]
+SHOULD_BE_SUPPRESSED = [(t, w[1:-1]) for t, wl in WHITELIST.items() for w in wl if to_be_suppressed(w)]
+WHITELIST = dict((t, filter_whitelist(wl)) for t, wl in WHITELIST.items())
+
 TYPE_BLACKLIST = (gcc.PointerType, gcc.IntegerType, gcc.VoidType, gcc.RealType, gcc.BooleanType, gcc.TypeDecl)
 
 def iter_triples(prefix:str, start):
@@ -60,7 +73,7 @@ def iter_triples(prefix:str, start):
         # we use GUIDs for functions because the nodes must identify
         # in order to merge local cfgs into a supergraph
         if isinstance(obj, gcc.FunctionDecl):
-            return "functions:" + obj.name # TODO handle module namespace
+            return "functions:{}".format(obj.name) # TODO handle module namespace
 
         try:
             h = hash(obj.str_no_uid) # GIMPLE statements have these
@@ -79,8 +92,8 @@ def iter_triples(prefix:str, start):
             hashes[h] = len(hashes)+1
             identifier = hashes[h]
 
-        name = "{}.{}".format(type(obj).__name__, identifier)
-        return "_:{}.{}".format(prefix, name)
+        name = "{}_{}".format(type(obj).__name__, identifier)
+        return "{}:{}".format(prefix, name)
 
     def repr_literal(obj):
         '''
@@ -117,10 +130,9 @@ def iter_triples(prefix:str, start):
 
         for p, e in iterator:
             try:
-                if WHITELIST[type(obj)] == ALL:
-                    yield p, e
-                elif p in WHITELIST[type(obj)]:
-                    yield p, e
+                if p in WHITELIST[type(obj)]:
+                    express = not (type(obj), p) in SHOULD_BE_SUPPRESSED
+                    yield p if express else p[1:-1], e, express
             except KeyError:
                 pass
 
@@ -145,7 +157,7 @@ def iter_triples(prefix:str, start):
                 return
             closed[r] = obj
 
-            for prop, entry in iter_relevant_props(obj):
+            for prop, entry, express in iter_relevant_props(obj):
                 #print(prop, type(entry))
                 open.append(entry)
         else:
@@ -161,9 +173,11 @@ def iter_triples(prefix:str, start):
 
     def yield_triples(node):
         rn, _ = repr_obj(node)
-        yield "{} rdf:a gcc:{}.".format(rn, type(node).__name__)
-        for prop, value in iter_relevant_props(node):
-            if not is_rdf_none(value): # None and empty list is expressed in RDF by omission
+        yield "{} a gcc:{}.".format(rn, type(node).__name__)
+        for prop, value, express in iter_relevant_props(node):
+            # TODO there actually is a rdf:nil. But I don't understand yet
+            #      in which cases you should use it
+            if express and not is_rdf_none(value): # None and empty list is expressed in RDF by omission
                 r, obj_type = repr_obj(value)
                 yield "{} gcc:{} {}.".format(rn, prop, r)
 
@@ -190,6 +204,7 @@ class ShowGimple(gcc.GimplePass):
         prefix = "{}_{}".format(".".join(basename(fun.decl.location.file).split(".")[:-1]),
                                 fun.decl.name)
 
+        print("@prefix {prefix}:<http://www.{prefix}.com>.".format(prefix=prefix))
         for line in iter_triples(prefix, fun):
             print(line)
 
