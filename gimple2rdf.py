@@ -18,6 +18,11 @@ BLACKLIST = ["unsigned_equivalent", "signed_equivalent", "sizeof",
              "str_no_uid" # not relevant for rdf graph
              ]
 
+# for development/debugging purposes
+# it is convenient to be able to express
+# "export ALL properties" of object to RDF
+ALL = uuid.uuid4()
+
 # because using the blacklist we got a VERY big, verbose graph,
 # we now try it using a whitelist
 # for each type all properties to expand the graph traversal on are
@@ -50,8 +55,12 @@ WHITELIST = {gcc.BasicBlock: ["gimple", "(succs)", "(preds)"],
 def to_be_suppressed(w: str) -> bool:
     return w[0] == '(' and w[-1] == ')'
 def filter_whitelist(wl):
-    return [w[1:-1] if to_be_suppressed(w) else w for w in wl]
-SHOULD_BE_SUPPRESSED = [(t, w[1:-1]) for t, wl in WHITELIST.items() for w in wl if to_be_suppressed(w)]
+    if wl is ALL:
+        return wl
+    else:
+        return [w[1:-1] if to_be_suppressed(w) else w for w in wl]
+# contains pairs (type, property) which should not be expressed in rdf
+SHOULD_BE_SUPPRESSED = [(t, w[1:-1]) for t, wl in WHITELIST.items() if not WHITELIST[t] is ALL for w in wl if to_be_suppressed(w)]
 WHITELIST = dict((t, filter_whitelist(wl)) for t, wl in WHITELIST.items())
 
 TYPE_BLACKLIST = (gcc.PointerType, gcc.IntegerType, gcc.VoidType, gcc.RealType, gcc.BooleanType, gcc.TypeDecl)
@@ -70,11 +79,14 @@ def iter_triples(prefix:str, start):
         '''
         # h is the hash value
 
-        # we use GUIDs for functions because the nodes must identify
-        # in order to merge local cfgs into a supergraph
+        # - we use GUIDs for functions because the nodes must identify
+        #   in order to merge local cfgs into a supergraph
+        # - we use GUIDs for locations because in their nature they already
+        #   describe globally unique identities
         if isinstance(obj, gcc.FunctionDecl):
             return "functions:{}".format(obj.name) # TODO handle module namespace
-
+        elif isinstance(obj, gcc.Location):
+            return "<file://{}#{}>".format(obj.file, obj.line)
         try:
             h = hash(obj.str_no_uid) # GIMPLE statements have these
         except AttributeError:
@@ -116,7 +128,10 @@ def iter_triples(prefix:str, start):
         if r is not None:
             return r, "literal"
         elif isinstance(obj, (list, tuple)):
-            return "({})".format(" ".join(str(repr_obj(e)[0]) for e in obj)), "list"
+            if len(obj) == 0:
+                return "nil", "literal"
+            else:
+                return "({})".format(" ".join(str(repr_obj(e)[0]) for e in obj)), "list"
         else:
             return make_uri(obj), "node"
 
@@ -130,7 +145,7 @@ def iter_triples(prefix:str, start):
 
         for p, e in iterator:
             try:
-                if p in WHITELIST[type(obj)]:
+                if WHITELIST[type(obj)] is ALL or p in WHITELIST[type(obj)]:
                     express = not (type(obj), p) in SHOULD_BE_SUPPRESSED
                     yield p if express else p[1:-1], e, express
             except KeyError:
@@ -166,8 +181,6 @@ def iter_triples(prefix:str, start):
     def is_rdf_none(value):
         if value is None:
             return True
-        if isinstance(value, (list, tuple)) and len(value) == 0:
-            return True
         else:
             return False
 
@@ -175,9 +188,7 @@ def iter_triples(prefix:str, start):
         rn, _ = repr_obj(node)
         yield "{} a gcc:{}.".format(rn, type(node).__name__)
         for prop, value, express in iter_relevant_props(node):
-            # TODO there actually is a rdf:nil. But I don't understand yet
-            #      in which cases you should use it
-            if express and not is_rdf_none(value): # None and empty list is expressed in RDF by omission
+            if express and not is_rdf_none(value): # None is expressed in RDF by omission
                 r, obj_type = repr_obj(value)
                 yield "{} gcc:{} {}.".format(rn, prop, r)
 
